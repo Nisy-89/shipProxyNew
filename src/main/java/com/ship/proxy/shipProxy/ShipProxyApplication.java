@@ -90,7 +90,7 @@ public class ShipProxyApplication {
 			offshoreOut.write(requestHeaders.getBytes());
 			offshoreOut.flush();
 
-			// Copy body if content-length or POST body is expected (optional enhancement)
+			
 
 			// Read full response and send back to client
 			relay(offshoreIn, clientOutput);
@@ -106,7 +106,7 @@ public class ShipProxyApplication {
 				out.flush();
 			}
 		} catch (IOException e) {
-			// silent disconnect
+			
 		}
 	}
 }
