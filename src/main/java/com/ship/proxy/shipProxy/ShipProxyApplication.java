@@ -1,93 +1,112 @@
 package com.ship.proxy.shipProxy;
-import org.springframework.boot.SpringApplication;
-import org.springframework.boot.autoconfigure.SpringBootApplication;
-import org.springframework.http.*;
-import org.springframework.web.bind.annotation.*;
 
-import javax.servlet.http.HttpServletRequest;
 import java.io.*;
-import java.net.Socket;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.net.*;
 
-@SpringBootApplication
-@RestController
 public class ShipProxyApplication {
+	private static final int SHIP_PROXY_PORT = 8080;
 	private static final String OFFSHORE_PROXY_HOST = "localhost";
 	private static final int OFFSHORE_PROXY_PORT = 9090;
-	private static PrintWriter out;
-	private static BufferedReader in;
-	private static final BlockingQueue<RequestResponsePair> requestQueue = new LinkedBlockingQueue<>();
 
 	public static void main(String[] args) {
-		SpringApplication.run(ShipProxyApplication.class, args);
-		startProxyThread();
-	}
-
-	private static void startProxyThread() {
-		new Thread(() -> {
-			try {
-				Socket socket = new Socket(OFFSHORE_PROXY_HOST, OFFSHORE_PROXY_PORT);
-				out = new PrintWriter(socket.getOutputStream(), true);
-				in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
-
-				while (true) {
-					RequestResponsePair requestResponsePair = requestQueue.take();
-					synchronized (requestResponsePair) {
-						out.println(requestResponsePair.request);
-						out.flush();
-
-						// Read response from offshore proxy
-						StringBuilder response = new StringBuilder();
-						String line;
-						while ((line = in.readLine()) != null && !line.isEmpty()) {
-							response.append(line).append("\n");
-						}
-
-						requestResponsePair.response = response.toString();
-						requestResponsePair.notify();
-					}
-				}
-			} catch (Exception e) {
-				e.printStackTrace();
+		System.out.println("Ship Proxy listening on port " + SHIP_PROXY_PORT);
+		try (ServerSocket serverSocket = new ServerSocket(SHIP_PROXY_PORT)) {
+			while (true) {
+				Socket clientSocket = serverSocket.accept();
+				new Thread(() -> handleClientConnection(clientSocket)).start();
 			}
-		}).start();
-	}
-
-	@RequestMapping("/**")
-	public ResponseEntity<String> handleRequest(@RequestBody(required = false) String body,
-												@RequestHeader HttpHeaders headers,
-												HttpServletRequest request) {
-		try {
-			String requestUrl = request.getRequestURL().toString();
-			if (request.getQueryString() != null) {
-				requestUrl += "?" + request.getQueryString();
-			}
-
-			String method = request.getMethod();
-			String proxyRequest = method + " " + requestUrl + " HTTP/1.1\n" +
-					headers.toString() + "\n\n" +
-					(body != null ? body : "");
-
-			RequestResponsePair requestResponsePair = new RequestResponsePair(proxyRequest);
-			requestQueue.add(requestResponsePair);
-
-			synchronized (requestResponsePair) {
-				requestResponsePair.wait();
-			}
-
-			return ResponseEntity.ok(requestResponsePair.response);
-		} catch (Exception e) {
-			return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body("Error: " + e.getMessage());
+		} catch (IOException e) {
+			System.err.println("Error starting Ship Proxy: " + e.getMessage());
 		}
 	}
 
-	private static class RequestResponsePair {
-		String request;
-		String response;
+	private static void handleClientConnection(Socket clientSocket) {
+		try (
+				InputStream clientInput = clientSocket.getInputStream();
+				OutputStream clientOutput = clientSocket.getOutputStream();
+				BufferedReader reader = new BufferedReader(new InputStreamReader(clientInput))
+		) {
+			String requestLine = reader.readLine();
+			if (requestLine == null || requestLine.isEmpty()) return;
 
-		RequestResponsePair(String request) {
-			this.request = request;
+			StringBuilder headers = new StringBuilder();
+			headers.append(requestLine).append("\r\n");
+			String line;
+			while ((line = reader.readLine()) != null && !line.isEmpty()) {
+				headers.append(line).append("\r\n");
+			}
+			headers.append("\r\n");
+
+			System.out.println("Received request:\n" + headers);
+
+			if (requestLine.startsWith("CONNECT")) {
+				handleConnect(clientSocket, headers.toString(), clientInput, clientOutput);
+			} else {
+				handleHttp(clientSocket, headers.toString(), clientInput, clientOutput);
+			}
+
+		} catch (IOException e) {
+			System.err.println("Error handling client request: " + e.getMessage());
+		}
+	}
+
+	private static void handleConnect(Socket clientSocket, String requestHeaders, InputStream clientInput, OutputStream clientOutput) throws IOException {
+		try (
+				Socket offshoreSocket = new Socket(OFFSHORE_PROXY_HOST, OFFSHORE_PROXY_PORT);
+				InputStream offshoreIn = offshoreSocket.getInputStream();
+				OutputStream offshoreOut = offshoreSocket.getOutputStream()
+		) {
+			// Send CONNECT to offshore proxy
+			offshoreOut.write(requestHeaders.getBytes());
+			offshoreOut.flush();
+
+			// Read response from offshore proxy
+			BufferedReader offshoreReader = new BufferedReader(new InputStreamReader(offshoreIn));
+			StringBuilder responseHeaders = new StringBuilder();
+			String line;
+			while ((line = offshoreReader.readLine()) != null && !line.isEmpty()) {
+				responseHeaders.append(line).append("\r\n");
+			}
+			responseHeaders.append("\r\n");
+
+			clientOutput.write(responseHeaders.toString().getBytes());
+			clientOutput.flush();
+
+			// Start tunnel
+			Thread t1 = new Thread(() -> relay(clientInput, offshoreOut));
+			Thread t2 = new Thread(() -> relay(offshoreIn, clientOutput));
+			t1.start();
+			t2.start();
+		}
+	}
+
+	private static void handleHttp(Socket clientSocket, String requestHeaders, InputStream clientInput, OutputStream clientOutput) throws IOException {
+		try (
+				Socket offshoreSocket = new Socket(OFFSHORE_PROXY_HOST, OFFSHORE_PROXY_PORT);
+				InputStream offshoreIn = offshoreSocket.getInputStream();
+				OutputStream offshoreOut = offshoreSocket.getOutputStream()
+		) {
+			// Forward HTTP request to offshore proxy
+			offshoreOut.write(requestHeaders.getBytes());
+			offshoreOut.flush();
+
+			// Copy body if content-length or POST body is expected (optional enhancement)
+
+			// Read full response and send back to client
+			relay(offshoreIn, clientOutput);
+		}
+	}
+
+	private static void relay(InputStream in, OutputStream out) {
+		try {
+			byte[] buffer = new byte[8192];
+			int len;
+			while ((len = in.read(buffer)) != -1) {
+				out.write(buffer, 0, len);
+				out.flush();
+			}
+		} catch (IOException e) {
+			// silent disconnect
 		}
 	}
 }
